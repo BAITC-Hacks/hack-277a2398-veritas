@@ -1,249 +1,273 @@
-"""Veritas: умный подбор event-подрядчиков для HackAlem AI."""
+"""Veritas — подбор event-подрядчиков. CSV parsing uses only Python stdlib."""
 from __future__ import annotations
 
 import ast
 import csv
+import json
 import os
 import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
-APP_DIR = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent
 DATE_MIN, DATE_MAX = date(2026, 9, 23), date(2026, 12, 31)
 CITIES = ["Алматы", "Астана", "Зарубежье"]
 LANGUAGES = ["Казахский", "Русский", "Английский"]
-EVENT_FORMATS = ["свадьба", "той", "корпоратив", "конференция", "юбилей", "день рождения"]
-CATEGORIES = ["Ведущий", "Фотограф", "Банкетный зал", "Флорист", "Декоратор", "Видеограф", "Лайв-бэнд", "Ведущий церемонии", "Подарки и сувениры", "Фото и видеобудки", "Инструменталист"]
+FORMATS = ["свадьба", "той", "корпоратив", "конференция", "юбилей", "день рождения"]
+PREFERRED = ["Ведущий", "Фотограф", "Банкетный зал", "Флорист", "Декоратор", "Видеограф", "Лайв-бэнд", "Ведущий церемонии", "Подарки и сувениры", "Фото и видеобудки", "Инструменталист"]
 DEMOS = {
-    "d1": ("Плотная категория (Алматы, Ведущий, 15.10.2026, Корпоратив, 1 000 000 ₸)", "Алматы", "Ведущий", date(2026, 10, 15), "корпоратив", 1_000_000),
-    "d2": ("Редкая категория (Астана, Флорист, 05.11.2026, Свадьба, 350 000 ₸)", "Астана", "Флорист", date(2026, 11, 5), "свадьба", 350_000),
-    "d3": ("Запрос без результата (Алматы, Ведущий, 25.12.2026, Той, 300 000 ₸)", "Алматы", "Ведущий", date(2026, 12, 25), "той", 300_000),
+    "demo1": ("Плотная категория (Алматы, Ведущий, 15.10.2026, Корпоратив, 1 000 000 ₸)", "Алматы", "Ведущий", date(2026, 10, 15), "корпоратив", 1_000_000),
+    "demo2": ("Редкая категория (Астана, Флорист, 05.11.2026, Свадьба, 350 000 ₸)", "Астана", "Флорист", date(2026, 11, 5), "свадьба", 350_000),
+    "demo3": ("Запрос без результата (Алматы, Ведущий, 25.12.2026, Той, 300 000 ₸)", "Алматы", "Ведущий", date(2026, 12, 25), "той", 300_000),
 }
+MODES = ["🟢 Демо-ключ Veritas (OpenAI gpt-4o)", "🔑 Ввести свой OpenAI API Key", "⚡ Автономный режим (Без API / Offline Fallback)"]
 
 
-def parse_list_field(value: Any) -> list[str]:
-    if value is None:
-        return []
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "null"}:
+def parse_list(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text or text.casefold() in {"none", "null", "nan"}:
         return []
     if text.startswith("[") and text.endswith("]"):
         try:
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, (list, tuple)):
-                return [str(x).strip() for x in parsed if str(x).strip()]
+            result = ast.literal_eval(text)
+            if isinstance(result, (list, tuple)):
+                return [str(x).strip() for x in result if str(x).strip()]
         except (ValueError, SyntaxError):
             pass
-    return [p.strip().strip("'\"[]") for p in re.split(r"[,;|]", text) if p.strip().strip("'\"[]")]
+    return [x.strip().strip("'\"[]") for x in re.split(r"[,;|]", text) if x.strip().strip("'\"[]")]
 
 
-def parse_number(value: Any) -> Optional[float]:
+def number(value: Any) -> Optional[float]:
     try:
-        text = str(value or "").strip()
-        return float(text) if text else None
+        return float(value) if str(value or "").strip() else None
     except (TypeError, ValueError):
         return None
 
 
-def norm(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value).strip().casefold())
+def norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
 
 
-def contains(values: list[str], target: str) -> bool:
-    return any(norm(v) == norm(target) for v in values)
+def has(values: list[str], value: str) -> bool:
+    return any(norm(v) == norm(value) for v in values)
 
 
-def find_dataset_path() -> Path:
-    for candidate in (APP_DIR / "hackathon-dataset-anonymized.csv", APP_DIR / "hackathon-dataset-anonymized .csv"):
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError("Не найден hackathon-dataset-anonymized.csv рядом с app.py")
+def money(value: int | float) -> str:
+    return f"{int(value):,}".replace(",", " ") + " ₸"
+
+
+def team_api_key() -> Optional[str]:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("OPENAI_API_KEY", "")).strip() or None
+    except Exception:
+        # Missing secrets.toml is expected for local/offline installations.
+        return None
+
+
+def dataset_path() -> Path:
+    for p in (ROOT / "hackathon-dataset-anonymized.csv", ROOT / "hackathon-dataset-anonymized .csv"):
+        if p.is_file():
+            return p
+    raise FileNotFoundError("Рядом с app.py не найден файл датасета CSV")
 
 
 @st.cache_data(show_spinner=False)
-def load_contractors() -> list[dict[str, Any]]:
-    required = {"id", "anon_name", "categories", "city", "price_from_kzt", "event_formats", "languages", "max_hours", "busy_dates", "description"}
-    with find_dataset_path().open("r", encoding="utf-8-sig", newline="") as f:
+def load_data() -> list[dict[str, Any]]:
+    needed = {"id", "anon_name", "categories", "city", "price_from_kzt", "event_formats", "languages", "max_hours", "busy_dates", "description"}
+    with dataset_path().open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        missing = required - set(reader.fieldnames or [])
+        missing = needed - set(reader.fieldnames or [])
         if missing:
             raise ValueError("В CSV отсутствуют колонки: " + ", ".join(sorted(missing)))
         rows = list(reader)
-    for row in rows:
-        row["categories_list"] = parse_list_field(row.get("categories"))
-        row["event_formats_list"] = parse_list_field(row.get("event_formats"))
-        row["languages_list"] = parse_list_field(row.get("languages"))
-        row["busy_dates_list"] = parse_list_field(row.get("busy_dates"))
-        row["price_from_kzt"] = parse_number(row.get("price_from_kzt"))
-        row["max_hours"] = parse_number(row.get("max_hours"))
-        row["description"] = (row.get("description") or "").strip()
-        for key in ("id", "anon_name", "city"):
-            row[key] = (row.get(key) or "").strip()
+    for r in rows:
+        for col in ("categories", "event_formats", "languages", "busy_dates"):
+            r[col + "_list"] = parse_list(r.get(col))
+        r["price_from_kzt"], r["max_hours"] = number(r.get("price_from_kzt")), number(r.get("max_hours"))
+        for col in ("id", "anon_name", "city", "description"):
+            r[col] = (r.get(col) or "").strip()
     return rows
 
 
-def format_kzt(amount: float | int) -> str:
-    return f"{int(amount):,}".replace(",", " ") + " ₸"
-
-
-def candidate_score(row: dict[str, Any], *, event_format: str, budget: int, language: Optional[str]) -> float:
-    """Фиксированные веса, без случайности: язык 45%, релевантность 35%, цена 20%."""
-    langs = row["languages_list"]
-    lang_score = 1.0 if language and contains(langs, language) else (0.5 if langs else 0.0)
-    description = norm(row["description"])
+def score(r: dict[str, Any], fmt: str, budget: int, language: Optional[str]) -> float:
+    # Fixed weighted score: language fit/breadth 45%, format evidence 35%, price proximity 20%.
+    langs = r["languages_list"]
+    lang_fit = min(1.0, len(langs) / 3) if langs else 0.0
+    description = norm(r["description"])
     keywords = {
-        "свадьба": ("свадьб", "свадеб", "церемон", "молодож", "торжеств"),
-        "той": ("той", "традиц", "казах", "бата", "домбра"),
-        "корпоратив": ("корпоратив", "команд", "компан", "бренд", "партнер", "партнёр"),
-        "конференция": ("конференц", "форум", "делов", "спикер", "панел"),
-        "юбилей": ("юбиле", "торжеств", "семейн", "поздравлен"),
+        "свадьба": ("свадьб", "церемон", "молодож", "торжеств"), "той": ("той", "традиц", "казах", "бата", "домбра"),
+        "корпоратив": ("корпоратив", "команд", "компан", "бренд", "партнер", "партнёр", "квн", "телевиз", "тв"),
+        "конференция": ("конференц", "форум", "делов", "спикер", "панел"), "юбилей": ("юбиле", "торжеств", "семейн"),
         "день рождения": ("день рожден", "именин", "праздник", "шоу"),
-    }.get(norm(event_format), ())
-    rel_score = min(1.0, sum(1 for word in keywords if word in description) / max(1, min(3, len(keywords))))
-    price = row["price_from_kzt"]
-    price_score = max(0.0, 1.0 - abs(budget - price) / max(1, budget)) if price is not None else 0.0
-    return (0.45 * lang_score if language else 0.0) + 0.35 * rel_score + 0.20 * price_score
+    }.get(norm(fmt), ())
+    relevance = min(1.0, sum(word in description for word in keywords) / max(1, min(3, len(keywords))))
+    price = r["price_from_kzt"]
+    proximity = max(0.0, 1 - abs(budget - price) / max(1, budget)) if price is not None else 0.0
+    return 0.45 * lang_fit + 0.35 * relevance + 0.20 * proximity
 
 
-def reject_reason(row: dict[str, Any], event_date: date, event_format: str, budget: int, language: Optional[str], duration: Optional[float]) -> Optional[str]:
-    if event_date.isoformat() in row["busy_dates_list"]:
-        return "busy"
-    if row["price_from_kzt"] is None or row["price_from_kzt"] > budget:
-        return "budget"
-    if not contains(row["event_formats_list"], event_format):
-        return "format"
-    if language and not contains(row["languages_list"], language):
-        return "language"
-    if duration is not None and row["max_hours"] is not None and row["max_hours"] < duration:
-        return "duration"
-    return None
-
-
-def filter_contractors(rows: list[dict[str, Any]], *, city: str, category: str, event_date: date, event_format: str, budget: int, language: Optional[str] = None, duration: Optional[float] = None) -> dict[str, Any]:
-    pool = [r for r in rows if norm(r["city"]) == norm(city) and contains(r["categories_list"], category)]
+def search(rows: list[dict[str, Any]], city: str, category: str, event_date: date, fmt: str, budget: int, language: Optional[str], duration: Optional[float]) -> dict[str, Any]:
+    pool = [r for r in rows if norm(r["city"]) == norm(city) and has(r["categories_list"], category)]
     counts = {k: 0 for k in ("busy", "budget", "format", "language", "duration")}
     passed = []
-    for row in pool:
-        reason = reject_reason(row, event_date, event_format, budget, language, duration)
-        if reason:
-            counts[reason] += 1
-        else:
-            passed.append(row)
-    passed.sort(key=lambda r: (-candidate_score(r, event_format=event_format, budget=budget, language=language), str(r["id"]), norm(r["anon_name"])))
-    outcome = "B" if not pool else ("A" if passed else "V")
-    return {"outcome": outcome, "pool": pool, "pool_size": len(pool), "matched": passed[:3], "matched_total": len(passed), "reject_counts": counts, "city": city, "category": category, "event_date": event_date, "event_format": event_format, "budget": budget, "language": language, "duration": duration}
+    for r in pool:
+        reason = None
+        if event_date.isoformat() in r["busy_dates_list"]: reason = "busy"
+        elif r["price_from_kzt"] is None or r["price_from_kzt"] > budget: reason = "budget"
+        elif not has(r["event_formats_list"], fmt): reason = "format"
+        elif language and not has(r["languages_list"], language): reason = "language"
+        elif duration is not None and r["max_hours"] is not None and r["max_hours"] < duration: reason = "duration"
+        if reason: counts[reason] += 1
+        else: passed.append(r)
+    passed.sort(key=lambda r: (-score(r, fmt, budget, language), str(r["id"]), norm(r["anon_name"])))
+    return {"pool": pool, "counts": counts, "passed": passed, "outcome": "B" if not pool else "A" if passed else "V"}
 
 
-def rejection_report(result: dict[str, Any]) -> str:
-    names = {"busy": "заняты на эту дату", "budget": "не укладываются в бюджет", "format": f"не проводят мероприятия в формате {result['event_format'].capitalize()}", "language": f"не знают язык {result['language']}", "duration": "не подходят по длительности"}
-    details = [f"{n} {names[key]}" for key, n in result["reject_counts"].items() if n]
-    return f"В городе найдено {result['pool_size']} специалистов категории «{result['category']}», но: " + ("; ".join(details) if details else "никто не прошёл условия") + "."
+def offline_explanation(r: dict[str, Any], budget: int, fmt: str, requested_language: Optional[str]) -> str:
+    """Pure local deterministic explanation; performs no external calls."""
+    price = int(r["price_from_kzt"] or 0)
+    savings = budget - price
+    desc = re.sub(r"\s+", " ", r["description"]).strip()
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", desc) if s.strip()]
+    evidence_terms = {
+        "той": ("той", "дәстүр", "традиц", "бата", "домбр", "казах"),
+        "свадьба": ("свадьб", "церемон", "молодож", "венчан"),
+        "корпоратив": ("корпоратив", "команд", "компан", "квн", "телевиз", "эфир", "бренд"),
+        "конференция": ("конференц", "форум", "спикер", "панел", "делов"),
+        "юбилей": ("юбиле", "семейн", "торжеств"),
+        "день рождения": ("день рожден", "именин", "праздник", "шоу"),
+    }.get(norm(fmt), ())
+    fact = next((s for s in sentences if any(term in norm(s) for term in evidence_terms)), "")
+    if not fact:
+        fact = sentences[0] if sentences else "В описании профиля нет подробностей."
+    if len(fact) > 300:
+        fact = fact[:297].rsplit(" ", 1)[0] + "…"
+    langs = r["languages_list"]
+    formats = r["event_formats_list"]
+    matched_langs = [x for x in langs if not requested_language or norm(x) == norm(requested_language)]
+    matched_formats = [x for x in formats if norm(x) == norm(fmt)]
+    lang_text = ", ".join(matched_langs) if matched_langs else ", ".join(langs) or "не указаны"
+    fmt_text = ", ".join(matched_formats) if matched_formats else ", ".join(formats) or "не указаны"
+    return (f"Цена от {money(price)}; экономия относительно бюджета — {money(savings)}. "
+            f"Совпавший формат: {fmt_text}; языки профиля: {lang_text}. "
+            f"Связь с вашим событием «{fmt}»: {fact}")
 
 
-def explanation_facts(row: dict[str, Any], budget: int, event_format: str, language: Optional[str]) -> str:
-    price = int(row["price_from_kzt"] or 0)
-    saving = max(0, budget - price)
-    desc = re.sub(r"\s+", " ", row["description"]).strip()
-    # Выбираем строку описания с конкретным совпадением по формату; иначе даём содержательный фрагмент.
-    sentences = re.split(r"(?<=[.!?])\s+", desc)
-    tokens = {"той": ("той", "традиц", "домбр", "бата"), "свадьба": ("свадьб", "церемон", "молодож"), "корпоратив": ("корпоратив", "команд", "компан", "квн", "телевиз", "тв"), "конференция": ("конференц", "форум", "спикер", "делов"), "юбилей": ("юбиле", "семейн", "торжеств"), "день рождения": ("именин", "день рожден", "праздник")}.get(norm(event_format), ())
-    fact = next((s.strip() for s in sentences if any(t in norm(s) for t in tokens)), desc[:280])
-    parts = [f"Цена — {format_kzt(price)}, экономия относительно бюджета — {format_kzt(saving)}.", f"Релевантный факт из профиля для формата «{event_format}»: {fact or 'в профиле нет подробного описания'}"]
-    parts.append(f"В профиле указаны языки: {', '.join(row['languages_list']) or 'не указаны'}." if not language else f"Владеет требуемым языком «{language}».")
-    return " ".join(parts)
+def openai_explanation(r: dict[str, Any], key: str, city: str, category: str, event_date: date, fmt: str, budget: int, language: Optional[str], duration: Optional[float]) -> str:
+    price = int(r["price_from_kzt"] or 0)
+    prompt = f"""Запрос: {city}, категория {category}, дата {event_date.isoformat()}, формат {fmt}, бюджет {budget} KZT, язык {language or 'любой'}, длительность {duration or 'не задана'} ч.
+Кандидат: {r['anon_name']}; цена {price} KZT; экономия {budget-price} KZT; языки {', '.join(r['languages_list'])}; форматы {', '.join(r['event_formats_list'])}; description: {r['description'][:1800]}
+Сформулируй 2–3 персональных предложения на русском. Найди уникальную конкретную зацепку только из description (награда, ТВ, КВН, традиции тоя, проекты или специализация) и объясни её ценность именно для заданного формата. Для разных кандидатов аргументы и стиль должны заметно отличаться. Укажи точную цену, экономию и требуемый язык, если задан. Не выдумывай факты; при отсутствии деталей опирайся на то, что реально указано. Не используй клише «отличный выбор»."""
+    body = json.dumps({
+        "model": "gpt-4o", "temperature": 0,
+        "messages": [{"role": "system", "content": "Ты консультант по event-подрядчикам. Используй только подтверждённые факты профиля."}, {"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    request = Request("https://api.openai.com/v1/chat/completions", data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+    with urlopen(request, timeout=18) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return str(payload["choices"][0]["message"].get("content") or "").strip()
 
 
-def call_openai(row: dict[str, Any], *, api_key: str, city: str, category: str, event_date: date, event_format: str, budget: int, language: Optional[str], duration: Optional[float]) -> str:
-    from openai import OpenAI
-    price = int(row["price_from_kzt"] or 0)
-    prompt = f"""Запрос заказчика: город {city}; категория {category}; дата {event_date.isoformat()}; формат {event_format}; бюджет {budget} KZT; язык {language or 'не задан'}; длительность {duration or 'не задана'} ч.
-Кандидат: {row['anon_name']}; цена от {price} KZT; экономия {max(0, budget-price)} KZT; языки: {', '.join(row['languages_list']) or 'не указаны'}; форматы: {', '.join(row['event_formats_list'])}; описание: {row['description'][:1800]}
-
-Напиши 2–3 ёмких предложения по-русски, персонально и с глубоким контекстом. Вытащи наиболее уникальную конкретную зацепку именно из этого description (например награду, эфир/ТВ, лигу КВН, традиции тоя, проекты или необычную специализацию) и объясни, почему она ценна именно для данного формата события. Другим кандидатам при том же запросе нужны принципиально иные аргументы и интонация: не используй шаблонную структуру или общие фразы. Обязательно назови точную цену, экономию относительно бюджета и язык, если он был запрошен. Не выдумывай факты и достижения; если уникальных деталей нет, честно опирайся на конкретные имеющиеся сведения. Запрещены клише вроде «отличный выбор». Только факты из профиля."""
-    response = OpenAI(api_key=api_key).chat.completions.create(model="gpt-4o", temperature=0, messages=[{"role": "system", "content": "Ты внимательный персональный консультант по event-подрядчикам. Анализируй только предоставленные факты; для каждого профиля находи его собственную сильную сторону."}, {"role": "user", "content": prompt}])
-    return (response.choices[0].message.content or "").strip() or explanation_facts(row, budget, event_format, language)
-
-
-def explain(row: dict[str, Any], *, api_key: Optional[str], **context: Any) -> tuple[str, str]:
-    key = f"{row['id']}|{context['city']}|{context['event_date']}|{context['event_format']}|{context['budget']}|{context['language']}|{bool(api_key)}"
-    cache = st.session_state.setdefault("explain_cache", {})
-    if key in cache:
-        return cache[key]
-    if api_key:
-        try:
-            result = (call_openai(row, api_key=api_key, **context), "OpenAI gpt-4o")
-        except Exception as exc:
-            result = (explanation_facts(row, context["budget"], context["event_format"], context["language"]) + f"\n\n_OpenAI недоступен ({type(exc).__name__}); показано объяснение по фактам._", "Объяснение по фактам")
+def explain(r: dict[str, Any], mode: str, key: Optional[str], **ctx: Any) -> tuple[str, str]:
+    cache = st.session_state.setdefault("explanation_cache", {})
+    cache_id = "|".join((r["id"], mode, str(ctx["event_date"]), ctx["event_format"], str(ctx["budget"]), str(ctx["language"]), str(bool(key))))
+    if cache_id in cache:
+        return cache[cache_id]
+    if mode == MODES[2] or not key:
+        result = (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
     else:
-        result = (explanation_facts(row, context["budget"], context["event_format"], context["language"]), "Объяснение по фактам")
-    cache[key] = result
+        try:
+            content = openai_explanation(r, key, ctx["city"], ctx["category"], ctx["event_date"], ctx["event_format"], ctx["budget"], ctx["language"], ctx["duration"])
+            result = (content, "OpenAI gpt-4o") if content else (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
+        except Exception:
+            # Covers network errors, quota/rate limits, SDK errors; fallback is local and deterministic.
+            result = (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
+    cache[cache_id] = result
     return result
-
-
-def set_demo(name: str) -> None:
-    _, city, category, event_date, fmt, budget = DEMOS[name]
-    st.session_state.update(city=city, category=category, event_date=event_date, event_format=fmt, budget=budget, language="Не важно", duration_enabled=False, run_search=True)
 
 
 def main() -> None:
     st.set_page_config(page_title="Veritas — подбор event-подрядчиков", page_icon="✨", layout="wide")
     st.title("VERITAS · Умный подбор event-подрядчиков")
-    st.caption("HackAlem AI · Детерминированная фильтрация и контекстные объяснения")
+    st.caption("HackAlem AI · Детерминированный подбор и персональные объяснения")
     cols = st.columns(3)
-    for col, name in zip(cols, DEMOS):
-        if col.button(DEMOS[name][0], use_container_width=True, type="primary" if name == "d1" else "secondary"):
-            set_demo(name)
+    for col, demo_id in zip(cols, DEMOS):
+        label, city, cat, dt, fmt, budget = DEMOS[demo_id]
+        if col.button(label, use_container_width=True):
+            st.session_state.update(city=city, category=cat, event_date=dt, event_format=fmt, budget=budget, language_choice="Не важно", duration_enabled=False, run_search=True)
             st.rerun()
     try:
-        rows = load_contractors()
-    except Exception as exc:
-        st.error(f"Не удалось загрузить датасет: {exc}")
+        rows = load_data()
+    except Exception as e:
+        st.error(f"Не удалось загрузить датасет: {e}")
         st.stop()
-    available = sorted({c for row in rows for c in row["categories_list"]})
-    categories = [c for c in CATEGORIES if c in available] + sorted(c for c in available if c not in CATEGORIES)
+    all_categories = sorted({c for r in rows for c in r["categories_list"]})
+    categories = [c for c in PREFERRED if c in all_categories] + [c for c in all_categories if c not in PREFERRED]
     with st.sidebar:
         st.header("Параметры поиска")
-        api_env = os.getenv("OPENAI_API_KEY", "")
-        api_key = st.text_input("OpenAI API Key", value=api_env, type="password", help="Можно также задать переменную окружения OPENAI_API_KEY.").strip() or None
-        st.caption("Объяснения через gpt-4o" if api_key else "Без ключа будут показаны объяснения по фактам профиля")
+        st.markdown("**Режим генерации объяснений:**")
+        mode = st.radio("Режим генерации объяснений:", MODES, index=0, label_visibility="collapsed", key="generation_mode")
+        key: Optional[str] = None
+        if mode == MODES[0]:
+            key = team_api_key()
+            if key:
+                st.success("Командный ключ подключён · генерация объяснений GPT-4o")
+            else:
+                st.warning("Ключ команды не настроен. Используется автономный генератор. Добавьте OPENAI_API_KEY в окружение или Streamlit Secrets для режима GPT-4o.")
+        elif mode == MODES[1]:
+            key = st.text_input("Ваш OpenAI API Key", type="password", help="Ключ используется только для запросов из этой сессии.").strip() or None
+            if not key:
+                st.info("Введите ключ или переключитесь в автономный режим.")
+        else:
+            st.info("Работает локально: сетевых запросов и API-ключей нет.")
+        st.divider()
         city = st.selectbox("Город", CITIES, key="city")
         category = st.selectbox("Категория", categories, key="category")
         event_date = st.date_input("Дата мероприятия", min_value=DATE_MIN, max_value=DATE_MAX, key="event_date")
-        event_format = st.selectbox("Формат мероприятия", EVENT_FORMATS, key="event_format")
+        fmt = st.selectbox("Формат мероприятия", FORMATS, key="event_format")
         budget = int(st.number_input("Бюджет, ₸", min_value=10_000, max_value=20_000_000, step=10_000, key="budget"))
-        lang_choice = st.selectbox("Желаемый язык (необязательно)", ["Не важно"] + LANGUAGES, key="language")
+        lang_choice = st.selectbox("Желаемый язык (необязательно)", ["Не важно"] + LANGUAGES, key="language_choice")
         language = None if lang_choice == "Не важно" else lang_choice
         duration_enabled = st.checkbox("Указать длительность", key="duration_enabled")
-        duration = float(st.number_input("Длительность, часов", 1.0, 24.0, 4.0, 1.0)) if duration_enabled else None
+        duration = float(st.number_input("Длительность, часов", min_value=1.0, max_value=24.0, value=4.0, step=1.0)) if duration_enabled else None
         if st.button("Найти подрядчиков", type="primary", use_container_width=True):
             st.session_state["run_search"] = True
-    st.info(f"**Запрос:** {city} · {category} · {event_date:%d.%m.%Y} · {event_format.capitalize()} · {format_kzt(budget)} · {language or 'язык любой'} · {str(duration)+' ч' if duration else 'длительность любая'}")
+    st.info(f"**Запрос:** {city} · {category} · {event_date:%d.%m.%Y} · {fmt.capitalize()} · {money(budget)} · {language or 'любой язык'} · {str(duration)+' ч' if duration else 'любая длительность'}")
     if not st.session_state.get("run_search"):
-        st.info("Выберите параметры и нажмите «Найти подрядчиков» или запустите один из демо-сценариев выше.")
+        st.info("Задайте параметры или выберите демо-сценарий, затем нажмите «Найти подрядчиков».")
         return
-    result = filter_contractors(rows, city=city, category=category, event_date=event_date, event_format=event_format, budget=budget, language=language, duration=duration)
+    result = search(rows, city, category, event_date, fmt, budget, language, duration)
     if result["outcome"] == "B":
         st.warning(f"В городе {city} нет специалистов в категории {category}")
         return
+    counts = result["counts"]
+    reason_labels = {"busy": "заняты на эту дату", "budget": "не укладываются в бюджет", "format": f"не проводят мероприятия в формате {fmt}", "language": f"не знают язык {language}", "duration": "не подходят по длительности"}
+    details = "; ".join(f"{n} {reason_labels[k]}" for k, n in counts.items() if n) or "условиям поиска"
     if result["outcome"] == "V":
         st.error("Подходящих подрядчиков не найдено")
-        st.write(rejection_report(result))
+        st.write(f"В городе найдено {len(result['pool'])} специалистов категории «{category}», но: {details}.")
         return
-    st.success(f"Подходящих кандидатов: {result['matched_total']} · показан детерминированный топ-{len(result['matched'])}")
-    if result["matched_total"] < 3:
-        st.warning(f"Выдача неполная: найдено {result['matched_total']} из 3 возможных. " + (rejection_report(result) if result["pool_size"] > result["matched_total"] else f"В городе найдено только {result['pool_size']} специалист(а) этой категории."))
-    for i, row in enumerate(result["matched"], 1):
+    passed = result["passed"]
+    st.success(f"Подходящих кандидатов: {len(passed)} · показан детерминированный топ-{min(3, len(passed))}")
+    if len(passed) < 3:
+        st.warning(f"Выдача неполная: найдено {len(passed)} из 3. " + (f"В городе найдено {len(result['pool'])} специалистов; {details}." if len(result['pool']) > len(passed) else f"В городе только {len(result['pool'])} специалист(а) этой категории."))
+    ctx = dict(city=city, category=category, event_date=event_date, event_format=fmt, budget=budget, language=language, duration=duration)
+    for i, r in enumerate(passed[:3], 1):
         with st.container(border=True):
-            st.subheader(f"{i}. {row['anon_name']}")
-            st.write(f"**Цена от:** {format_kzt(row['price_from_kzt'] or 0)} · **Экономия:** {format_kzt(max(0, budget-int(row['price_from_kzt'] or 0)))}")
-            st.caption(f"ID: {row['id']} · Категории: {', '.join(row['categories_list'])} · Форматы: {', '.join(row['event_formats_list'])} · Языки: {', '.join(row['languages_list']) or 'не указаны'}")
-            explanation, source = explain(row, api_key=api_key, city=city, category=category, event_date=event_date, event_format=event_format, budget=budget, language=language, duration=duration)
-            st.info(f"**Почему подходит · {source}**\n\n{explanation}")
+            st.subheader(f"{i}. {r['anon_name']}")
+            st.write(f"**Цена от:** {money(r['price_from_kzt'] or 0)} · **Экономия:** {money(max(0, budget-int(r['price_from_kzt'] or 0)))}")
+            st.caption(f"ID: {r['id']} · Категории: {', '.join(r['categories_list'])} · Форматы: {', '.join(r['event_formats_list'])} · Языки: {', '.join(r['languages_list']) or 'не указаны'}")
+            text, badge = explain(r, mode, key, **ctx)
+            st.info(f"**Объяснение: {badge}**\n\n{text}")
             with st.expander("Описание профиля"):
-                st.write(row["description"] or "Описание отсутствует")
+                st.write(r["description"] or "Описание отсутствует")
 
 
 if __name__ == "__main__":
