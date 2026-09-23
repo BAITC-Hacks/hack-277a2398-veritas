@@ -283,7 +283,8 @@ def main() -> None:
             st.subheader(f"{i}. {r['anon_name']}{synth_badge}")
             st.write(f"**Цена от:** {money(r['price_from_kzt'] or 0)} · **Экономия:** {money(max(0, budget-int(r['price_from_kzt'] or 0)))}")
             st.caption(f"ID: {r['id']} · Категории: {', '.join(r['categories_list'])} · Форматы: {', '.join(r['event_formats_list'])} · Языки: {', '.join(r['languages_list']) or 'не указаны'}")
-            text, badge = explain(r, mode, key, **ctx)
+            with st.spinner("Генерируется объяснение ИИ…"):
+                text, badge = explain(r, mode, key, **ctx)
             st.info(f"**Объяснение: {badge}**\n\n{text}")
             with st.expander("Описание профиля"):
                 st.write(r["description"] or "Описание отсутствует")
