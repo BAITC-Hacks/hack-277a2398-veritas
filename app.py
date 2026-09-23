@@ -24,7 +24,7 @@ DEMOS = {
     "demo2": ("Редкая категория (Астана, Флорист, 05.11.2026, Свадьба, 350 000 ₸)", "Астана", "Флорист", date(2026, 11, 5), "свадьба", 350_000),
     "demo3": ("Запрос без результата (Алматы, Ведущий, 25.12.2026, Той, 300 000 ₸)", "Алматы", "Ведущий", date(2026, 12, 25), "той", 300_000),
 }
-MODES = ["🟢 Демо-ключ Veritas (OpenAI gpt-4o)", "🔑 Ввести свой OpenAI API Key", "⚡ Автономный режим (Без API / Offline Fallback)"]
+MODES = ["🔑 Ввести свой OpenAI API Key", "🟢 Использовать демо-ключ команды Veritas (GPT-4o)", "⚡ Автономный режим (Offline Fallback)"]
 
 
 def parse_list(value: Any) -> list[str]:
@@ -97,10 +97,10 @@ def load_data() -> list[dict[str, Any]]:
     return rows
 
 
-def score(r: dict[str, Any], fmt: str, budget: int, language: Optional[str]) -> float:
-    # Fixed weighted score: language fit/breadth 45%, format evidence 35%, price proximity 20%.
+def score(r: dict[str, Any], fmt: str, budget: int, language: Optional[str], duration: Optional[float]) -> float:
+    # Fixed weights: languages 35%, description 30%, budget proximity 20%, hours 15%.
     langs = r["languages_list"]
-    lang_fit = min(1.0, len(langs) / 3) if langs else 0.0
+    lang_fit = 1.0 if language and has(langs, language) else (min(1.0, len(langs) / 3) if langs else 0.0)
     description = norm(r["description"])
     keywords = {
         "свадьба": ("свадьб", "церемон", "молодож", "торжеств"), "той": ("той", "традиц", "казах", "бата", "домбра"),
@@ -111,7 +111,9 @@ def score(r: dict[str, Any], fmt: str, budget: int, language: Optional[str]) -> 
     relevance = min(1.0, sum(word in description for word in keywords) / max(1, min(3, len(keywords))))
     price = r["price_from_kzt"]
     proximity = max(0.0, 1 - abs(budget - price) / max(1, budget)) if price is not None else 0.0
-    return 0.45 * lang_fit + 0.35 * relevance + 0.20 * proximity
+    hours = r["max_hours"]
+    hours_fit = 1.0 if duration is None or hours is None or hours >= duration else 0.0
+    return 0.35 * lang_fit + 0.30 * relevance + 0.20 * proximity + 0.15 * hours_fit
 
 
 def search(rows: list[dict[str, Any]], city: str, category: str, event_date: date, fmt: str, budget: int, language: Optional[str], duration: Optional[float]) -> dict[str, Any]:
@@ -127,7 +129,7 @@ def search(rows: list[dict[str, Any]], city: str, category: str, event_date: dat
         elif duration is not None and r["max_hours"] is not None and r["max_hours"] < duration: reason = "duration"
         if reason: counts[reason] += 1
         else: passed.append(r)
-    passed.sort(key=lambda r: (-score(r, fmt, budget, language), str(r["id"]), norm(r["anon_name"])))
+    passed.sort(key=lambda r: (-score(r, fmt, budget, language, duration), str(r["id"]), norm(r["anon_name"])))
     return {"pool": pool, "counts": counts, "passed": passed, "outcome": "B" if not pool else "A" if passed else "V"}
 
 
@@ -187,8 +189,9 @@ def explain(r: dict[str, Any], mode: str, key: Optional[str], **ctx: Any) -> tup
         try:
             content = openai_explanation(r, key, ctx["city"], ctx["category"], ctx["event_date"], ctx["event_format"], ctx["budget"], ctx["language"], ctx["duration"])
             result = (content, "OpenAI gpt-4o") if content else (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
-        except Exception:
+        except Exception as e:
             # Covers network errors, quota/rate limits, SDK errors; fallback is local and deterministic.
+            st.error(f"Сбой OpenAI API: {e}")
             result = (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
     cache[cache_id] = result
     return result
@@ -198,12 +201,15 @@ def main() -> None:
     st.set_page_config(page_title="Veritas — подбор event-подрядчиков", page_icon="✨", layout="wide")
     st.title("VERITAS · Умный подбор event-подрядчиков")
     st.caption("HackAlem AI · Детерминированный подбор и персональные объяснения")
+    demo_clicked = False
     cols = st.columns(3)
     for col, demo_id in zip(cols, DEMOS):
-        label, city, cat, dt, fmt, budget = DEMOS[demo_id]
+        label, city, category, event_date, fmt, budget = DEMOS[demo_id]
         if col.button(label, use_container_width=True):
-            st.session_state.update(city=city, category=cat, event_date=dt, event_format=fmt, budget=budget, language_choice="Не важно", duration_enabled=False, run_search=True)
-            st.rerun()
+            st.session_state.update(city=city, category=category, event_date=event_date, event_format=fmt, budget=budget, language_choice="Не важно", duration_enabled=False)
+            st.session_state["search_params"] = {"city": city, "category": category, "event_date": event_date, "fmt": fmt, "budget": budget, "language": None, "duration": None}
+            st.session_state["run_search"] = True
+            demo_clicked = True
     try:
         rows = load_data()
     except Exception as e:
@@ -211,39 +217,60 @@ def main() -> None:
         st.stop()
     all_categories = sorted({c for r in rows for c in r["categories_list"]})
     categories = [c for c in PREFERRED if c in all_categories] + [c for c in all_categories if c not in PREFERRED]
+    if "city" not in st.session_state: st.session_state["city"] = CITIES[0]
+    if "category" not in st.session_state: st.session_state["category"] = categories[0]
+    if "event_date" not in st.session_state: st.session_state["event_date"] = date(2026, 10, 15)
+    if "event_format" not in st.session_state: st.session_state["event_format"] = FORMATS[0]
+    if "budget" not in st.session_state: st.session_state["budget"] = 1_000_000
+    if "language_choice" not in st.session_state: st.session_state["language_choice"] = "Не важно"
+    if "duration_enabled" not in st.session_state: st.session_state["duration_enabled"] = False
+
     with st.sidebar:
         st.header("Параметры поиска")
         st.markdown("**Режим генерации объяснений:**")
         mode = st.radio("Режим генерации объяснений:", MODES, index=0, label_visibility="collapsed", key="generation_mode")
         key: Optional[str] = None
         if mode == MODES[0]:
+            key = st.text_input("Введите ваш OpenAI API Key", type="password", key="user_api_key").strip() or None
+            if not key:
+                st.warning("⚠️ Пожалуйста, введите ваш ключ OpenAI или переключите режим на 'Демо-ключ' / 'Автономный режим'.")
+        elif mode == MODES[1]:
             key = team_api_key()
             if key:
                 st.success("Командный ключ подключён · генерация объяснений GPT-4o")
             else:
-                st.warning("Ключ команды не настроен. Используется автономный генератор. Добавьте OPENAI_API_KEY в окружение или Streamlit Secrets для режима GPT-4o.")
-        elif mode == MODES[1]:
-            key = st.text_input("Ваш OpenAI API Key", type="password", help="Ключ используется только для запросов из этой сессии.").strip() or None
-            if not key:
-                st.info("Введите ключ или переключитесь в автономный режим.")
+                st.warning("Ключ команды не настроен. Автоматически выполнить запрос GPT-4o невозможно.")
         else:
             st.info("Работает локально: сетевых запросов и API-ключей нет.")
         st.divider()
-        city = st.selectbox("Город", CITIES, key="city")
-        category = st.selectbox("Категория", categories, key="category")
-        event_date = st.date_input("Дата мероприятия", min_value=DATE_MIN, max_value=DATE_MAX, key="event_date")
-        fmt = st.selectbox("Формат мероприятия", FORMATS, key="event_format")
-        budget = int(st.number_input("Бюджет, ₸", min_value=10_000, max_value=20_000_000, step=10_000, key="budget"))
-        lang_choice = st.selectbox("Желаемый язык (необязательно)", ["Не важно"] + LANGUAGES, key="language_choice")
-        language = None if lang_choice == "Не важно" else lang_choice
-        duration_enabled = st.checkbox("Указать длительность", key="duration_enabled")
-        duration = float(st.number_input("Длительность, часов", min_value=1.0, max_value=24.0, value=4.0, step=1.0)) if duration_enabled else None
-        if st.button("Найти подрядчиков", type="primary", use_container_width=True):
+        with st.form("search_form"):
+            city = st.selectbox("Город", CITIES, key="city")
+            category = st.selectbox("Категория", categories, key="category")
+            event_date = st.date_input("Дата", min_value=DATE_MIN, max_value=DATE_MAX, key="event_date")
+            fmt = st.selectbox("Формат", FORMATS, key="event_format")
+            budget = int(st.number_input("Бюджет, ₸", min_value=10_000, max_value=20_000_000, step=10_000, key="budget"))
+            lang_choice = st.selectbox("Язык", ["Не важно"] + LANGUAGES, key="language_choice")
+            duration_enabled = st.checkbox("Указать длительность", key="duration_enabled")
+            duration = float(st.number_input("Часы", min_value=1.0, max_value=24.0, value=4.0, step=1.0, key="duration_hours")) if duration_enabled else None
+            submit = st.form_submit_button("Найти подходящих подрядчиков", type="primary", use_container_width=True, disabled=(mode == MODES[0] and not key))
+        if submit and key is not None or submit and mode == MODES[2]:
+            st.session_state["search_params"] = {"city": city, "category": category, "event_date": event_date, "fmt": fmt, "budget": budget, "language": None if lang_choice == "Не важно" else lang_choice, "duration": duration}
             st.session_state["run_search"] = True
-    st.info(f"**Запрос:** {city} · {category} · {event_date:%d.%m.%Y} · {fmt.capitalize()} · {money(budget)} · {language or 'любой язык'} · {str(duration)+' ч' if duration else 'любая длительность'}")
-    if not st.session_state.get("run_search"):
-        st.info("Задайте параметры или выберите демо-сценарий, затем нажмите «Найти подрядчиков».")
+        elif submit and mode == MODES[1] and key is None:
+            st.session_state["run_search"] = False
+
+    # Never show default results on first load; only submitted searches or demo presets run.
+    if demo_clicked:
+        st.rerun()
+    if not st.session_state.get("run_search") or "search_params" not in st.session_state:
+        st.info("👋 Задайте параметры мероприятия и нажмите кнопку поиска или выберите готовый сценарий наверху.")
         return
+    if mode == MODES[0] and not key:
+        st.warning("⚠️ Пожалуйста, введите ваш ключ OpenAI или переключите режим на 'Демо-ключ' / 'Автономный режим'.")
+        return
+    params = st.session_state["search_params"]
+    city, category, event_date, fmt = params["city"], params["category"], params["event_date"], params["fmt"]
+    budget, language, duration = params["budget"], params["language"], params["duration"]
     result = search(rows, city, category, event_date, fmt, budget, language, duration)
     if result["outcome"] == "B":
         st.warning(f"В городе {city} нет специалистов в категории {category}")
