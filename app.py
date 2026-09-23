@@ -88,6 +88,7 @@ def load_data() -> list[dict[str, Any]]:
             raise ValueError("В CSV отсутствуют колонки: " + ", ".join(sorted(missing)))
         rows = list(reader)
     for r in rows:
+        r["is_synthetic"] = str(r.get("synthetic", "")).strip().lower() == "true"
         for col in ("categories", "event_formats", "languages", "busy_dates"):
             r[col + "_list"] = parse_list(r.get(col))
         r["price_from_kzt"], r["max_hours"] = number(r.get("price_from_kzt")), number(r.get("max_hours"))
@@ -261,7 +262,8 @@ def main() -> None:
     ctx = dict(city=city, category=category, event_date=event_date, event_format=fmt, budget=budget, language=language, duration=duration)
     for i, r in enumerate(passed[:3], 1):
         with st.container(border=True):
-            st.subheader(f"{i}. {r['anon_name']}")
+            synth_badge = " 🏷️ [Синтетический]" if r.get("is_synthetic") else ""
+            st.subheader(f"{i}. {r['anon_name']}{synth_badge}")
             st.write(f"**Цена от:** {money(r['price_from_kzt'] or 0)} · **Экономия:** {money(max(0, budget-int(r['price_from_kzt'] or 0)))}")
             st.caption(f"ID: {r['id']} · Категории: {', '.join(r['categories_list'])} · Форматы: {', '.join(r['event_formats_list'])} · Языки: {', '.join(r['languages_list']) or 'не указаны'}")
             text, badge = explain(r, mode, key, **ctx)
