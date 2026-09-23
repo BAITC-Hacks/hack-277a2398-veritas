@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 import csv
 import json
-import os
 import re
 from datetime import date
 from pathlib import Path
@@ -24,7 +23,7 @@ DEMOS = {
     "demo2": ("Редкая категория (Астана, Флорист, 05.11.2026, Свадьба, 350 000 ₸)", "Астана", "Флорист", date(2026, 11, 5), "свадьба", 350_000),
     "demo3": ("Запрос без результата (Алматы, Ведущий, 25.12.2026, Той, 300 000 ₸)", "Алматы", "Ведущий", date(2026, 12, 25), "той", 300_000),
 }
-MODES = ["🔑 Ввести свой OpenAI API Key", "🟢 Использовать демо-ключ команды Veritas (GPT-4o)", "⚡ Автономный режим (Offline Fallback)"]
+MODES = ["🔑 OpenAI GPT-4o (Ввести свой API Key)", "⚡ Автономный режим (Offline Fallback)"]
 
 
 def parse_list(value: Any) -> list[str]:
@@ -58,20 +57,6 @@ def has(values: list[str], value: str) -> bool:
 
 def money(value: int | float) -> str:
     return f"{int(value):,}".replace(",", " ") + " ₸"
-
-
-def team_api_key() -> Optional[str]:
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        sec = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-        if sec:
-            return sec
-    except Exception:
-        pass
-    # Защищенный демо-ключ команды Veritas ($50 OpenAI):
-    return "AwmV1frDAFz3siZ5r1E3OHTlykHIw-wyFkbhhj3fGEeYYI4ywcSwcwofyDBHAXKVbEGCcZlelG6CJFkb3TV03gL1asHhReyiExbjdkB1SWUXwOfApX4yBtlrDryVULvHVKwAlSu09fGm771xXqne5jpPfP1oy-jorp-ks"[::-1]
 
 
 def dataset_path() -> Path:
@@ -115,7 +100,13 @@ def score(r: dict[str, Any], fmt: str, budget: int, language: Optional[str], dur
     price = r["price_from_kzt"]
     proximity = max(0.0, 1 - abs(budget - price) / max(1, budget)) if price is not None else 0.0
     hours = r["max_hours"]
-    hours_fit = 1.0 if duration is None or hours is None or hours >= duration else 0.0
+    if duration is None or hours is None:
+        hours_fit = 1.0
+    else:
+        # Among providers who can cover the event, prefer the closest capacity match.
+        # The hard filter still excludes any known max_hours below the requested duration.
+        surplus = max(0.0, hours - duration)
+        hours_fit = 1.0 / (1.0 + surplus / max(duration, 1.0))
     return 0.35 * lang_fit + 0.30 * relevance + 0.20 * proximity + 0.15 * hours_fit
 
 
@@ -186,7 +177,7 @@ def explain(r: dict[str, Any], mode: str, key: Optional[str], **ctx: Any) -> tup
     cache_id = "|".join((r["id"], mode, str(ctx["event_date"]), ctx["event_format"], str(ctx["budget"]), str(ctx["language"]), str(bool(key))))
     if cache_id in cache:
         return cache[cache_id]
-    if mode == MODES[2] or not key:
+    if mode == MODES[1] or not key:
         result = (offline_explanation(r, ctx["budget"], ctx["event_format"], ctx["language"]), "Детерминированный Fallback (Offline)")
     else:
         try:
@@ -204,15 +195,18 @@ def main() -> None:
     st.set_page_config(page_title="Veritas — подбор event-подрядчиков", page_icon="✨", layout="wide")
     st.title("VERITAS · Умный подбор event-подрядчиков")
     st.caption("HackAlem AI · Детерминированный подбор и персональные объяснения")
-    demo_clicked = False
+    should_search = False
     cols = st.columns(3)
     for col, demo_id in zip(cols, DEMOS):
         label, city, category, event_date, fmt, budget = DEMOS[demo_id]
         if col.button(label, use_container_width=True):
+            saved_key = str(st.session_state.get("user_api_key", "")).strip()
+            if not saved_key:
+                # A demo preset must run with one click even before a user enters a key.
+                st.session_state["generation_mode"] = MODES[1]
             st.session_state.update(city=city, category=category, event_date=event_date, event_format=fmt, budget=budget, language_choice="Не важно", duration_enabled=False)
             st.session_state["search_params"] = {"city": city, "category": category, "event_date": event_date, "fmt": fmt, "budget": budget, "language": None, "duration": None}
-            st.session_state["run_search"] = True
-            demo_clicked = True
+            should_search = True
     try:
         rows = load_data()
     except Exception as e:
@@ -231,20 +225,17 @@ def main() -> None:
     with st.sidebar:
         st.header("Параметры поиска")
         st.markdown("**Режим генерации объяснений:**")
+        if st.session_state.get("generation_mode") not in MODES:
+            st.session_state["generation_mode"] = MODES[0]
         mode = st.radio("Режим генерации объяснений:", MODES, index=0, label_visibility="collapsed", key="generation_mode")
         key: Optional[str] = None
         if mode == MODES[0]:
             key = st.text_input("Введите ваш OpenAI API Key", type="password", key="user_api_key").strip() or None
             if not key:
-                st.warning("⚠️ Пожалуйста, введите ваш ключ OpenAI или переключите режим на 'Демо-ключ' / 'Автономный режим'.")
-        elif mode == MODES[1]:
-            key = team_api_key()
-            if key:
-                st.success("Командный ключ подключён · генерация объяснений GPT-4o")
-            else:
-                st.warning("Ключ команды не настроен. Автоматически выполнить запрос GPT-4o невозможно.")
+                st.warning("⚠️ Введите ключ для GPT-4o или переключитесь на 'Автономный режим'.")
         else:
-            st.info("Работает локально: сетевых запросов и API-ключей нет.")
+            key = None
+            st.info("⚡ Локальная генерация: быстро, детерминированно, без внешних запросов к сети.")
         st.divider()
         with st.form("search_form"):
             city = st.selectbox("Город", CITIES, key="city")
@@ -256,20 +247,16 @@ def main() -> None:
             duration_enabled = st.checkbox("Указать длительность", key="duration_enabled")
             duration = float(st.number_input("Часы", min_value=1.0, max_value=24.0, value=4.0, step=1.0, key="duration_hours")) if duration_enabled else None
             submit = st.form_submit_button("Найти подходящих подрядчиков", type="primary", use_container_width=True, disabled=(mode == MODES[0] and not key))
-        if submit and key is not None or submit and mode == MODES[2]:
+        if submit and (key is not None or mode == MODES[1]):
             st.session_state["search_params"] = {"city": city, "category": category, "event_date": event_date, "fmt": fmt, "budget": budget, "language": None if lang_choice == "Не важно" else lang_choice, "duration": duration}
-            st.session_state["run_search"] = True
-        elif submit and mode == MODES[1] and key is None:
-            st.session_state["run_search"] = False
+            should_search = True
 
-    # Never show default results on first load; only submitted searches or demo presets run.
-    if demo_clicked:
-        st.rerun()
-    if not st.session_state.get("run_search") or "search_params" not in st.session_state:
+    # Selectbox/key/radio reruns do not repeat the last search; only submit or preset triggers it.
+    if not should_search or "search_params" not in st.session_state:
         st.info("👋 Задайте параметры мероприятия и нажмите кнопку поиска или выберите готовый сценарий наверху.")
         return
     if mode == MODES[0] and not key:
-        st.warning("⚠️ Пожалуйста, введите ваш ключ OpenAI или переключите режим на 'Демо-ключ' / 'Автономный режим'.")
+        st.warning("⚠️ Введите ключ для GPT-4o или переключитесь на 'Автономный режим'.")
         return
     params = st.session_state["search_params"]
     city, category, event_date, fmt = params["city"], params["category"], params["event_date"], params["fmt"]
